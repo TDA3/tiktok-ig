@@ -64,6 +64,22 @@ PLATFORM_IDENTIFIERS = {
 # URL validation
 URL_PATTERN = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+')
 
+# Profile URL patterns for bulk download feature
+# These match profile URLs only — NOT individual post/video URLs.
+# Must be checked BEFORE PLATFORM_IDENTIFIERS matching.
+TIKTOK_PROFILE_PATTERN = re.compile(
+    r'(?:https?://)?(?:www\.)?tiktok\.com/@([A-Za-z0-9_.]+)/?(?:\?.*)?$'
+)
+INSTAGRAM_PROFILE_PATTERN = re.compile(
+    r'(?:https?://)?(?:www\.)?instagram\.com/'
+    r'(?!(?:p|reel|reels|tv|stories|explore|accounts|direct|locations|tags|'
+    r'share|legal|privacy|terms|about|press|api|graphql)(?:/|$|\?))'
+    r'([A-Za-z0-9_.]+)/?(?:\?.*)?$'
+)
+
+# Maximum number of posts to download per profile bulk-download request
+MAX_PROFILE_DOWNLOADS = 50
+
 
 def extract_url(text: str) -> Optional[str]:
     """Extract the first URL from text."""

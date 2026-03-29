@@ -9,7 +9,7 @@ import aiohttp
 import yt_dlp
 from aiogram.types import FSInputFile
 
-from config import TEMP_DIRECTORY, PLATFORM_IDENTIFIERS, COOKIES_FILE, COOKIES_ENABLED
+from config import TEMP_DIRECTORY, PLATFORM_IDENTIFIERS, COOKIES_FILE, COOKIES_ENABLED, MAX_PROFILE_DOWNLOADS
 from utils.user_agent_utils import get_random_user_agent
 from utils.common_utils import safe_edit_message
 from utils.cleanup import cleanup_temp_directory
@@ -432,3 +432,109 @@ async def detect_platform_and_process(message, bot, url, progress_msg=None):
             return True
 
     return False
+
+
+async def process_profile_download(message, bot, url, progress_msg,
+                                   tiktok_username=None, instagram_username=None):
+    """Download all videos/posts from a TikTok or Instagram profile.
+
+    Sends each media item individually to the user with progress updates.
+    Respects Telegram rate limits by sleeping between sends.
+    """
+    username = tiktok_username or instagram_username
+    platform = "TikTok" if tiktok_username else "Instagram"
+
+    downloader = SimpleVideoDownloader()
+
+    # Step 1: Announce scanning
+    await safe_edit_message(progress_msg, f"👤 Scanning @{username}'s profile...")
+
+    # Step 2: Scrape all post URLs via the platform's profile extractor
+    try:
+        async with aiohttp.ClientSession() as session:
+            extractor = get_extractor(platform, session)
+            if not extractor:
+                await safe_edit_message(
+                    progress_msg, f"❌ No extractor available for {platform}"
+                )
+                return
+
+            if tiktok_username:
+                posts = await extractor.extract_profile(tiktok_username)
+            else:
+                posts = await extractor.extract_profile(instagram_username)
+    except Exception as e:
+        logger.error(f"Profile scrape failed for @{username}: {e}")
+        await safe_edit_message(
+            progress_msg, f"❌ Could not scrape profile: {str(e)[:100]}"
+        )
+        return
+
+    if not posts:
+        await safe_edit_message(
+            progress_msg,
+            f"😔 No posts found for @{username}. "
+            "The profile may be private, empty, or temporarily unavailable."
+        )
+        return
+
+    # Cap to the configured limit
+    total = min(len(posts), MAX_PROFILE_DOWNLOADS)
+    posts = posts[:total]
+
+    # Step 3: Report how many posts were found
+    await safe_edit_message(
+        progress_msg, f"📊 Found {total} videos/posts. Starting download..."
+    )
+
+    # Step 4: Download and send each post
+    downloaded = 0
+    skipped = 0
+
+    for i, post in enumerate(posts, 1):
+        post_url = post["url"]
+
+        await safe_edit_message(progress_msg, f"⬇️ Downloading {i}/{total}...")
+
+        temp_path = None
+        try:
+            temp_path = await downloader.download_video(
+                post_url, platform, message.from_user.id
+            )
+
+            if not temp_path:
+                logger.warning(f"Profile download: no file returned for {post_url}")
+                skipped += 1
+                continue
+
+            file_size_mb = get_file_size_mb(temp_path)
+            if file_size_mb > TELEGRAM_VIDEO_SIZE_LIMIT_MB:
+                logger.info(
+                    f"Profile download: skipping {post_url} — "
+                    f"too large ({file_size_mb:.1f} MB)"
+                )
+                skipped += 1
+                continue
+
+            await send_video_with_fallback(bot, message, temp_path, platform)
+            downloaded += 1
+
+        except Exception as e:
+            logger.warning(f"Profile download: failed for {post_url}: {e}")
+            skipped += 1
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except Exception:
+                    pass
+
+        # Brief pause between sends to respect Telegram rate limits
+        if i < total:
+            await asyncio.sleep(2)
+
+    # Step 5: Final summary
+    await safe_edit_message(
+        progress_msg,
+        f"✅ Done! {downloaded} downloaded, {skipped} skipped"
+    )
