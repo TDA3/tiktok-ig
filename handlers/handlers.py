@@ -6,8 +6,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from config import PLATFORM_IDENTIFIERS, extract_url
-from handlers.social_media.video_processor import detect_platform_and_process
+from config import PLATFORM_IDENTIFIERS, extract_url, TIKTOK_PROFILE_PATTERN, INSTAGRAM_PROFILE_PATTERN
+from handlers.social_media.video_processor import detect_platform_and_process, process_profile_download
 from utils.user_management import (
     check_channel_subscription,
     increment_download_count,
@@ -57,6 +57,19 @@ async def process_video_link(message: Message, state: FSMContext):
 
     # Send processing message
     progress_msg = await message.answer("⬇️ Starting download...")
+
+    # Check for profile URLs before single-post processing
+    tiktok_profile_match = TIKTOK_PROFILE_PATTERN.match(url)
+    instagram_profile_match = INSTAGRAM_PROFILE_PATTERN.match(url)
+
+    if tiktok_profile_match or instagram_profile_match:
+        await process_profile_download(
+            message, message.bot, url, progress_msg,
+            tiktok_username=tiktok_profile_match.group(1) if tiktok_profile_match else None,
+            instagram_username=instagram_profile_match.group(1) if instagram_profile_match else None,
+        )
+        increment_download_count(user_id)
+        return
 
     # Detect platform and process video
     platform_detected = await detect_platform_and_process(

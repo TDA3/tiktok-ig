@@ -10,6 +10,7 @@ Extraction logic:
 
 import re
 import json
+import time
 from typing import Optional
 
 from .base import BaseExtractor, VideoResult, GENERIC_USER_AGENT
@@ -173,3 +174,90 @@ class TikTokExtractor(BaseExtractor):
             url=play_addr,
             filename=f"{filename_base}.mp4",
         )
+
+    async def extract_profile(self, username: str) -> list:
+        """
+        Scrape all video URLs from a TikTok profile using the web API.
+
+        Fetches the profile page to obtain the user's secUid via
+        __UNIVERSAL_DATA_FOR_REHYDRATION__, then paginates through the
+        TikTok post item_list API endpoint.
+
+        Returns a list of dicts: [{"url": "...", "id": "..."}, ...]
+        """
+        from config import MAX_PROFILE_DOWNLOADS
+
+        profile_url = f"https://www.tiktok.com/@{username}"
+        headers = {
+            "user-agent": GENERIC_USER_AGENT,
+            "Referer": "https://www.tiktok.com/",
+        }
+
+        # Step 1: Fetch profile page to extract secUid
+        html = await self.fetch(profile_url, headers=headers)
+        if not html:
+            self.logger.warning(f"TikTok profile: could not fetch page for @{username}")
+            return []
+
+        sec_uid = ""
+        try:
+            marker = '<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">'
+            if marker in html:
+                json_str = html.split(marker)[1].split("</script>")[0]
+                data = json.loads(json_str)
+                user_detail = (
+                    data.get("__DEFAULT_SCOPE__", {})
+                    .get("webapp.user-detail", {})
+                )
+                user_info = user_detail.get("userInfo", {})
+                sec_uid = user_info.get("user", {}).get("secUid", "")
+        except Exception as e:
+            self.logger.debug(f"TikTok profile parse error: {e}")
+
+        if not sec_uid:
+            self.logger.warning(f"TikTok profile: could not extract secUid for @{username}")
+            return []
+
+        # Step 2: Paginate using TikTok's post item_list API
+        videos = []
+        cursor = 0
+        has_more = True
+        web_id_last_time = int(time.time()) - 3600  # 1 hour ago
+
+        while has_more and len(videos) < MAX_PROFILE_DOWNLOADS:
+            api_url = (
+                f"https://www.tiktok.com/api/post/item_list/"
+                f"?WebIdLastTime={web_id_last_time}&aid=1988&count=30"
+                f"&secUid={sec_uid}&cursor={cursor}"
+            )
+            api_headers = {
+                **headers,
+                "Accept": "application/json, text/plain, */*",
+            }
+
+            try:
+                response = await self.fetch_json(api_url, headers=api_headers)
+                if not response:
+                    break
+
+                items = response.get("itemList", [])
+                for item in items:
+                    vid_id = item.get("id")
+                    if vid_id:
+                        videos.append({
+                            "url": f"https://www.tiktok.com/@{username}/video/{vid_id}",
+                            "id": vid_id,
+                        })
+
+                has_more = bool(response.get("hasMore", False))
+                cursor = response.get("cursor", 0)
+
+                if not items:
+                    break
+
+            except Exception as e:
+                self.logger.debug(f"TikTok profile API error: {e}")
+                break
+
+        self.logger.info(f"TikTok profile @{username}: found {len(videos)} videos")
+        return videos

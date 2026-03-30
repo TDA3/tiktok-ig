@@ -11,6 +11,7 @@ All methods work without login for public posts.
 
 import re
 import json
+import http.cookiejar
 from typing import Optional
 from urllib.parse import quote
 
@@ -343,3 +344,182 @@ class InstagramExtractor(BaseExtractor):
 
         self.logger.warning(f"Instagram: all methods failed for {post_id}")
         return None
+
+    # ------ Profile scraping ------
+
+    def _load_instagram_cookies(self) -> str:
+        """
+        Load Instagram cookies from cookies.txt (Netscape format) and return
+        a Cookie header string.  Returns empty string when cookies are unavailable.
+        """
+        from config import COOKIES_FILE, COOKIES_ENABLED
+        if not COOKIES_ENABLED:
+            return ""
+        try:
+            jar = http.cookiejar.MozillaCookieJar()
+            jar.load(COOKIES_FILE, ignore_discard=True, ignore_expires=True)
+            cookies = {
+                c.name: c.value
+                for c in jar
+                if c.domain == "instagram.com" or c.domain.endswith(".instagram.com")
+            }
+            return "; ".join(f"{k}={v}" for k, v in cookies.items())
+        except Exception as e:
+            self.logger.debug(f"Failed to load Instagram cookies: {e}")
+            return ""
+
+    async def extract_profile(self, username: str) -> list:
+        """
+        Scrape all post URLs from an Instagram profile.
+
+        Strategy:
+        1. Fetch the profile page to obtain the numeric user_id, LSD token,
+           and CSRF token.
+        2. Fall back to the mobile web_profile_info API if HTML parsing fails.
+        3. Paginate through posts using the Instagram GraphQL endpoint with the
+           ``edge_owner_to_timeline_media`` query.
+
+        Uses cookies from cookies.txt when available for private/authenticated
+        content.
+
+        Returns list of dicts: [{"url": "...", "shortcode": "..."}, ...]
+        """
+        from config import MAX_PROFILE_DOWNLOADS
+
+        cookie_header = self._load_instagram_cookies()
+
+        page_headers = dict(EMBED_HEADERS)
+        if cookie_header:
+            page_headers["Cookie"] = cookie_header
+
+        profile_url = f"https://www.instagram.com/{quote(username)}/"
+
+        # Step 1: Fetch profile page to get user_id and GQL tokens
+        html = await self.fetch(profile_url, headers=page_headers)
+
+        user_id = None
+        lsd = "unknown"
+        csrf = ""
+
+        if html:
+            # Try several patterns that Instagram embeds in page scripts
+            for pattern in [
+                r'"owner":\{"id":"(\d+)"',
+                r'"userId":"(\d+)"',
+                r'"id":"(\d+)","username":"' + re.escape(username),
+                r'"profileId":"(\d+)"',
+                r'"user_id":"(\d+)"',
+            ]:
+                m = re.search(pattern, html)
+                if m:
+                    user_id = m.group(1)
+                    break
+
+            lsd_match = re.search(r'"LSD",\[\],(\{.*?\}),\d+\]', html)
+            if lsd_match:
+                try:
+                    lsd = json.loads(lsd_match.group(1)).get("token", "unknown")
+                except Exception:
+                    pass
+
+            csrf_match = re.search(r'"csrf_token":"([^"]+)"', html)
+            if csrf_match:
+                csrf = csrf_match.group(1)
+
+        # Step 2: Fall back to mobile web_profile_info API for user_id
+        if not user_id:
+            mobile_headers = dict(MOBILE_HEADERS)
+            if cookie_header:
+                mobile_headers["Cookie"] = cookie_header
+            api_url = (
+                f"https://i.instagram.com/api/v1/users/web_profile_info/"
+                f"?username={quote(username)}"
+            )
+            data = await self.fetch_json(api_url, headers=mobile_headers)
+            if data:
+                user_id = (
+                    data.get("data", {})
+                    .get("user", {})
+                    .get("id")
+                )
+
+        if not user_id:
+            self.logger.warning(f"Instagram profile: could not get user_id for @{username}")
+            return []
+
+        # Step 3: Paginate through posts via GraphQL
+        posts = []
+        after_cursor = None
+
+        gql_headers = {
+            **EMBED_HEADERS,
+            "x-ig-app-id": "936619743392459",
+            "X-FB-LSD": lsd,
+            "X-CSRFToken": csrf,
+            "content-type": "application/x-www-form-urlencoded",
+            "X-FB-Friendly-Name": "PolarisProfilePostsQuery",
+        }
+        if cookie_header:
+            gql_headers["Cookie"] = cookie_header
+
+        while len(posts) < MAX_PROFILE_DOWNLOADS:
+            variables: dict = {"id": user_id, "first": 12}
+            if after_cursor:
+                variables["after"] = after_cursor
+
+            body = {
+                "__a": "1",
+                "__d": "www",
+                "lsd": lsd,
+                "fb_api_caller_class": "RelayModern",
+                "fb_api_req_friendly_name": "PolarisProfilePostsQuery",
+                "variables": json.dumps(variables),
+                "server_timestamps": "true",
+                "doc_id": "17888483320059182",
+            }
+
+            try:
+                data = await self.fetch_json(
+                    "https://www.instagram.com/graphql/query",
+                    headers=gql_headers,
+                    method="POST",
+                    data=body,
+                )
+            except Exception as e:
+                self.logger.debug(f"Instagram profile GQL error: {e}")
+                break
+
+            if not data:
+                break
+
+            # Navigate the response — structure varies slightly between accounts
+            user_node = (
+                data.get("data", {}).get("user")
+                or data.get("data", {})
+            )
+            timeline = (
+                user_node.get("edge_owner_to_timeline_media")
+                or user_node.get("edge_felix_video_timeline")
+            )
+
+            if not timeline:
+                break
+
+            for edge in timeline.get("edges", []):
+                node = edge.get("node", {})
+                shortcode = node.get("shortcode")
+                if shortcode:
+                    posts.append({
+                        "url": f"https://www.instagram.com/p/{shortcode}/",
+                        "shortcode": shortcode,
+                    })
+
+            page_info = timeline.get("page_info", {})
+            if not page_info.get("has_next_page"):
+                break
+            after_cursor = page_info.get("end_cursor")
+            if not after_cursor:
+                break
+
+        self.logger.info(f"Instagram profile @{username}: found {len(posts)} posts")
+        return posts
